@@ -1957,6 +1957,8 @@ def main():
                 console.print()
 
         result = run_agent(messages, model)
+        if result:
+            console.print(Markdown(result))
         console.print()
 
         # Cost per turn
