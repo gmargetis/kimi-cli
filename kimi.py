@@ -9,6 +9,11 @@ Usage:
   python3 kimi.py --image screenshot.png "what's in this image?"
   python3 kimi.py --orchestrate "build auth module"  # multi-agent orchestration
   python3 kimi.py -O "fix all TypeScript errors"     # orchestrate shorthand
+  python3 kimi.py --issue 42              # fix GitHub issue #42 and optionally create PR
+  python3 kimi.py --issue 42 --pr         # fix issue and auto-create PR
+  python3 kimi.py --index                 # build semantic search index for current dir
+  python3 kimi.py --search "auth logic"   # semantic search over indexed code
+  python3 kimi.py --tui                   # launch rich-based interactive TUI
 """
 
 import os
@@ -36,6 +41,8 @@ from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.live import Live
 from rich.text import Text
+from rich.layout import Layout
+from rich.align import Align
 from rich import print as rprint
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -373,6 +380,21 @@ TOOLS = [
                     "new_text": {"type": "string", "description": "Replacement text"}
                 },
                 "required": ["pattern", "old_text", "new_text"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "semantic_search",
+            "description": "Semantic search over indexed code files. Returns relevant code chunks by meaning. Run --index first to build the index.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Natural language query about the code"},
+                    "top_k": {"type": "integer", "description": "Number of results to return (default 5)"}
+                },
+                "required": ["query"]
             }
         }
     }
@@ -730,11 +752,29 @@ def execute_tool(name, args, extra_dispatch=None):
         "read_env":        lambda: read_env(args.get("path", ".env")),
         "write_env":       lambda: write_env(args["values"], args.get("path", ".env")),
         "edit_files_glob": lambda: edit_files_glob(args["pattern"], args["old_text"], args["new_text"]),
+        # Semantic search (available if index exists)
+        "semantic_search": lambda: _semantic_search_tool(args.get("query", ""), args.get("top_k", 5)),
     }
     if extra_dispatch:
         dispatch.update(extra_dispatch)
     fn = dispatch.get(name)
     return fn() if fn else f"Unknown tool: {name}"
+
+
+def _semantic_search_tool(query: str, top_k: int = 5) -> str:
+    """Wrapper for the semantic_search function usable as an agent tool."""
+    try:
+        results = semantic_search(query, ".", top_k)
+        if not results:
+            return "No results found."
+        lines = []
+        for r in results:
+            lines.append(f"## {r['file']}:{r['start_line']} (score={r['score']:.3f})\n{r['text'][:400]}")
+        return "\n\n---\n\n".join(lines)
+    except FileNotFoundError:
+        return "No semantic index found. Run `kimi.py --index` first."
+    except Exception as e:
+        return f"❌ Semantic search error: {e}"
 
 # ── Project context auto-loader ───────────────────────────────────────────────
 PROJECT_INDICATORS = {
@@ -1426,6 +1466,404 @@ def run_orchestrator(task: str, system_content: str, orchestrator_model: str,
     return final_summary
 
 
+# ── GitHub Issues Integration ─────────────────────────────────────────────────
+
+def _gh(cmd: str) -> str:
+    """Run a gh CLI command and return stdout."""
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or f"gh exit {result.returncode}")
+    return result.stdout.strip()
+
+
+def _parse_repo_from_remote(remote_url: str) -> tuple:
+    """Parse owner/repo from a git remote URL (HTTPS or SSH)."""
+    # SSH: git@github.com:owner/repo.git
+    m = re.match(r'git@[^:]+:([^/]+)/([^/]+?)(?:\.git)?$', remote_url)
+    if m:
+        return m.group(1), m.group(2)
+    # HTTPS: https://github.com/owner/repo.git
+    m = re.match(r'https?://[^/]+/([^/]+)/([^/]+?)(?:\.git)?$', remote_url)
+    if m:
+        return m.group(1), m.group(2)
+    raise ValueError(f"Cannot parse repo from remote URL: {remote_url}")
+
+
+def run_github_issue(issue_num: int, model: str, messages: list,
+                     auto_pr: bool, args) -> None:
+    """Fetch a GitHub issue, run agent to fix it, optionally create PR."""
+    console.print(f"[cyan]🐙 Loading GitHub issue #{issue_num}...[/cyan]")
+
+    # Detect repo
+    try:
+        remote_url = _gh("git remote get-url origin")
+        owner, repo = _parse_repo_from_remote(remote_url)
+        console.print(f"[dim]   Repo: {owner}/{repo}[/dim]")
+    except Exception as e:
+        console.print(f"[red]❌ Could not detect repo: {e}[/red]")
+        return
+
+    # Fetch issue
+    try:
+        issue_json = _gh(f"gh api repos/{owner}/{repo}/issues/{issue_num}")
+        issue = json.loads(issue_json)
+    except Exception as e:
+        console.print(f"[red]❌ Could not fetch issue: {e}[/red]")
+        return
+
+    # Fetch comments
+    comments_text = ""
+    try:
+        comments_json = _gh(f"gh api repos/{owner}/{repo}/issues/{issue_num}/comments")
+        comments = json.loads(comments_json)
+        if comments:
+            parts = []
+            for c in comments:
+                author = c.get("user", {}).get("login", "unknown")
+                body = c.get("body", "").strip()
+                parts.append(f"**{author}:** {body}")
+            comments_text = "\n\n".join(parts)
+        else:
+            comments_text = "(no comments)"
+    except Exception as e:
+        comments_text = f"(could not fetch comments: {e})"
+
+    issue_title = issue.get("title", f"Issue #{issue_num}")
+    issue_body  = issue.get("body") or "(no description)"
+
+    prompt = (
+        f"Fix GitHub issue #{issue_num}: {issue_title}\n\n"
+        f"Description:\n{issue_body}\n\n"
+        f"Comments:\n{comments_text}"
+    )
+
+    console.print(Panel(
+        f"[bold]#{issue_num}:[/bold] {issue_title}",
+        title="[bold cyan]🐙 GitHub Issue[/bold cyan]",
+        border_style="cyan"
+    ))
+
+    # Task planning
+    if not args.no_plan and should_plan(prompt):
+        console.print("[dim cyan]📋 Planning task...[/dim cyan]")
+        system_content = messages[0]["content"] if messages else ""
+        plan = run_planner(prompt, model, system_content)
+        if plan:
+            console.print(Panel(plan, title="[bold]📋 Plan[/bold]", border_style="blue"))
+            console.print()
+
+    messages.append({"role": "user", "content": prompt})
+    result = run_agent(messages, model)
+    console.print()
+
+    # PR creation
+    if auto_pr:
+        create_pr = True
+    else:
+        try:
+            answer = input("Create PR? (y/n): ").strip().lower()
+            create_pr = answer in ("y", "yes")
+        except (KeyboardInterrupt, EOFError):
+            create_pr = False
+
+    if create_pr:
+        console.print("[cyan]🔀 Creating PR...[/cyan]")
+        try:
+            pr_title = f"fix: {issue_title}"
+            pr_body  = f"Closes #{issue_num}"
+            pr_out = _gh(
+                f'gh pr create --title {json.dumps(pr_title)} --body {json.dumps(pr_body)}'
+            )
+            console.print(f"[green]✅ PR created: {pr_out}[/green]")
+        except Exception as e:
+            console.print(f"[red]❌ PR creation failed: {e}[/red]")
+
+
+# ── Semantic Search ───────────────────────────────────────────────────────────
+
+EMBED_MODEL  = "nvidia/llama-3.2-nv-embedqa-1b-v2"
+CODE_EXTENSIONS = {".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rs",
+                   ".java", ".php", ".rb", ".cpp", ".c", ".h"}
+INDEX_FILE = ".kimi_index.pkl"
+SKIP_DIRS  = {"node_modules", ".git", "dist", "__pycache__", ".kimi_index.pkl"}
+CHUNK_SIZE = 60   # lines per chunk
+CHUNK_OVERLAP = 10
+
+
+def _embed(texts: list) -> list:
+    """Call NVIDIA embeddings API and return list of float vectors."""
+    payload = json.dumps({
+        "model": EMBED_MODEL,
+        "input": texts,
+        "encoding_format": "float"
+    }).encode("utf-8")
+    req = urllib_request.Request(
+        "https://integrate.api.nvidia.com/v1/embeddings",
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {API_KEY}",
+        },
+        method="POST",
+    )
+    with urllib_request.urlopen(req, timeout=30) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    return [item["embedding"] for item in data["data"]]
+
+
+def _cosine_sim(v1: list, v2: list) -> float:
+    dot = sum(a * b for a, b in zip(v1, v2))
+    mag1 = sum(x * x for x in v1) ** 0.5
+    mag2 = sum(x * x for x in v2) ** 0.5
+    if mag1 == 0 or mag2 == 0:
+        return 0.0
+    return dot / (mag1 * mag2)
+
+
+def build_index(workdir: str = ".") -> None:
+    """Walk code files, chunk them, embed, and save to INDEX_FILE."""
+    root = Path(workdir).resolve()
+    chunks = []
+
+    # Collect all code files
+    all_files = []
+    for p in root.rglob("*"):
+        # Skip unwanted dirs
+        if any(skip in p.parts for skip in SKIP_DIRS):
+            continue
+        if p.is_file() and p.suffix in CODE_EXTENSIONS:
+            all_files.append(p)
+
+    console.print(f"[cyan]📁 Found {len(all_files)} code files. Embedding...[/cyan]")
+
+    for fpath in all_files:
+        try:
+            lines = fpath.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except Exception:
+            continue
+
+        rel = str(fpath.relative_to(root))
+        # Chunk with overlap
+        start = 0
+        while start < len(lines):
+            end = min(start + CHUNK_SIZE, len(lines))
+            chunk_text = "\n".join(lines[start:end])
+            if chunk_text.strip():
+                chunks.append({"file": rel, "start_line": start + 1, "text": chunk_text, "embedding": None})
+            start += CHUNK_SIZE - CHUNK_OVERLAP
+
+    console.print(f"[cyan]🔢 {len(chunks)} chunks to embed...[/cyan]")
+
+    # Batch-embed (NVIDIA API supports up to ~16 inputs at a time)
+    BATCH = 8
+    for i in range(0, len(chunks), BATCH):
+        batch = chunks[i:i + BATCH]
+        texts = [c["text"] for c in batch]
+        try:
+            embeddings = _embed(texts)
+            for c, emb in zip(batch, embeddings):
+                c["embedding"] = emb
+            console.print(f"[dim]  Embedded {min(i + BATCH, len(chunks))}/{len(chunks)}[/dim]")
+        except Exception as e:
+            console.print(f"[yellow]⚠️ Embedding batch {i//BATCH} failed: {e}[/yellow]")
+            for c in batch:
+                c["embedding"] = []
+
+    # Save
+    index_path = root / INDEX_FILE
+    index_path.write_bytes(pickle.dumps(chunks))
+    console.print(f"[green]✅ Index saved: {len(chunks)} chunks → {index_path}[/green]")
+
+
+def semantic_search(query: str, workdir: str = ".", top_k: int = 5) -> list:
+    """Search the semantic index for query. Returns top_k chunks."""
+    root = Path(workdir).resolve()
+    index_path = root / INDEX_FILE
+
+    if not index_path.exists():
+        raise FileNotFoundError(f"No index found at {index_path}. Run with --index first.")
+
+    chunks = pickle.loads(index_path.read_bytes())
+    # Filter out chunks with no embeddings
+    chunks = [c for c in chunks if c.get("embedding")]
+
+    if not chunks:
+        return []
+
+    try:
+        query_embedding = _embed([query])[0]
+    except Exception as e:
+        raise RuntimeError(f"Could not embed query: {e}")
+
+    scored = [
+        (c, _cosine_sim(query_embedding, c["embedding"]))
+        for c in chunks
+    ]
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return [{"file": c["file"], "start_line": c["start_line"], "text": c["text"], "score": s}
+            for c, s in scored[:top_k]]
+
+
+# Tool definition for semantic_search (added dynamically when index exists)
+SEMANTIC_SEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "semantic_search",
+        "description": "Semantic search over indexed code files. Returns relevant code chunks by meaning.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Natural language query"},
+                "top_k": {"type": "integer", "description": "Number of results (default 5)", "default": 5}
+            },
+            "required": ["query"]
+        }
+    }
+}
+
+
+# ── Rich TUI ──────────────────────────────────────────────────────────────────
+
+def run_tui(model: str, messages: list, session_name, args) -> None:
+    """Enhanced interactive mode using rich Layout + Live."""
+
+    recent_tools: list = []   # list of (tool_name, short_result)
+    conversation: list = []   # list of (role, text)
+
+    def _make_layout() -> Layout:
+        layout = Layout()
+        layout.split_column(
+            Layout(name="header", size=3),
+            Layout(name="body"),
+            Layout(name="footer", size=1),
+        )
+        layout["body"].split_row(
+            Layout(name="tools", ratio=1),
+            Layout(name="chat",  ratio=2),
+        )
+        return layout
+
+    def _header_panel() -> Panel:
+        inp  = total_tokens["input"]
+        out  = total_tokens["output"]
+        sess = session_name or "default"
+        return Panel(
+            f"[bold cyan]Kimi CLI[/bold cyan]  "
+            f"[dim]model:[/dim] [yellow]{model}[/yellow]  "
+            f"[dim]session:[/dim] [green]{sess}[/green]  "
+            f"[dim]tokens:[/dim] {inp}↑ {out}↓",
+            border_style="cyan",
+        )
+
+    def _tools_panel() -> Panel:
+        lines = []
+        for tname, tres in recent_tools[-12:]:
+            lines.append(f"[cyan]{tname}[/cyan]\n[dim]{tres[:60]}[/dim]")
+        body = "\n".join(lines) if lines else "[dim]No tool calls yet[/dim]"
+        return Panel(body, title="[bold]🔧 Tool Calls[/bold]", border_style="blue")
+
+    def _chat_panel() -> Panel:
+        lines = []
+        for role, text in conversation[-20:]:
+            if role == "user":
+                lines.append(f"[bold green]You:[/bold green] {text[:200]}")
+            else:
+                lines.append(f"[bold cyan]Kimi:[/bold cyan] {text[:300]}")
+        body = "\n\n".join(lines) if lines else "[dim]Start typing...[/dim]"
+        return Panel(body, title="[bold]💬 Conversation[/bold]", border_style="green")
+
+    def _footer() -> str:
+        return "[dim]Type your task · 'exit' quit · 'clear' reset · 'undo' revert · 'save' export[/dim]"
+
+    layout = _make_layout()
+
+    def _refresh_layout():
+        layout["header"].update(_header_panel())
+        layout["body"]["tools"].update(_tools_panel())
+        layout["body"]["chat"].update(_chat_panel())
+        layout["footer"].update(_footer())
+
+    # Patch run_agent to capture tool calls for display
+    original_execute_tool = execute_tool
+
+    def _patched_execute_tool(name, tool_args, extra_dispatch=None):
+        result = original_execute_tool(name, tool_args, extra_dispatch=extra_dispatch)
+        short = str(result)[:80].replace("\n", " ")
+        recent_tools.append((name, short))
+        return result
+
+    console.print("[cyan]🖥️  Kimi TUI — press Ctrl+C or type 'exit' to quit[/cyan]\n")
+
+    with Live(layout, console=console, refresh_per_second=4, screen=False) as live:
+        _refresh_layout()
+        live.update(layout)
+
+        while True:
+            live.stop()
+            try:
+                user_input = input("\n[You] > ").strip()
+            except (KeyboardInterrupt, EOFError):
+                break
+            live.start()
+
+            if user_input.lower() in ("exit", "quit", "bye"):
+                break
+            if user_input.lower() == "clear":
+                messages[:] = [messages[0]]
+                conversation.clear()
+                recent_tools.clear()
+                f = get_session_file(session_name)
+                f.unlink(missing_ok=True)
+                _refresh_layout()
+                continue
+            if user_input.lower() == "undo":
+                if undo_stack:
+                    path, original = undo_stack.pop()
+                    try:
+                        Path(path).write_text(original, encoding="utf-8")
+                        conversation.append(("assistant", f"✅ Restored {path}"))
+                    except Exception as e:
+                        conversation.append(("assistant", f"❌ Undo failed: {e}"))
+                else:
+                    conversation.append(("assistant", "⚠️ Nothing to undo."))
+                _refresh_layout()
+                continue
+            if user_input.lower() == "save":
+                try:
+                    fname = save_session_markdown(messages)
+                    conversation.append(("assistant", f"✅ Saved to {fname}"))
+                except Exception as e:
+                    conversation.append(("assistant", f"❌ Save failed: {e}"))
+                _refresh_layout()
+                continue
+            if not user_input:
+                continue
+
+            conversation.append(("user", user_input))
+            messages.append({"role": "user", "content": user_input})
+            _refresh_layout()
+            live.update(layout)
+
+            # Run agent
+            try:
+                result = run_agent(messages, model)
+            except Exception as e:
+                result = f"❌ Error: {e}"
+
+            conversation.append(("assistant", result or "(done)"))
+
+            t_in  = turn_tokens["input"]
+            t_out = turn_tokens["output"]
+            turn_cost = (t_in / 1000 * COST_PER_1K_INPUT) + (t_out / 1000 * COST_PER_1K_OUTPUT)
+            console.print(f"\n[dim]💬 Turn: {t_in}↑ {t_out}↓ · ~${turn_cost:.4f}[/dim]")
+
+            save_history(messages, session_name)
+            _refresh_layout()
+            live.update(layout)
+
+    console.print(f"\n[dim]{cost_summary()} · Bye! 👋[/dim]")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description="Kimi Coding CLI")
@@ -1442,6 +1880,16 @@ def main():
                         help="Activate multi-agent orchestration mode for a complex task")
     parser.add_argument("--workers", type=int, default=4,
                         help="Number of parallel workers for orchestration (default: 4, max: 8)")
+    parser.add_argument("--issue", "-I", type=int, default=None, metavar="N",
+                        help="Load GitHub issue #N as prompt and optionally create a PR after completion")
+    parser.add_argument("--pr", action="store_true",
+                        help="Auto-create a PR after completing a GitHub issue (use with --issue)")
+    parser.add_argument("--index", action="store_true",
+                        help="Build semantic search index for code files in workdir")
+    parser.add_argument("--search", default=None, metavar="QUERY",
+                        help="Semantic search over indexed code files")
+    parser.add_argument("--tui", action="store_true",
+                        help="Launch enhanced rich-based interactive TUI mode")
     args = parser.parse_args()
 
     # Model resolution
@@ -1520,6 +1968,43 @@ def main():
         )
         save_history(messages, args.session)
         return result
+
+    # ── Semantic index build ──────────────────────────────────────────────────
+    if args.index:
+        build_index(args.workdir)
+        console.print(f"\n[dim]{cost_summary()} · Index complete ✅[/dim]")
+        return
+
+    # ── Semantic search query ─────────────────────────────────────────────────
+    if args.search:
+        try:
+            results = semantic_search(args.search, args.workdir)
+            if not results:
+                console.print("[yellow]No results found.[/yellow]")
+            else:
+                for i, r in enumerate(results, 1):
+                    console.print(Panel(
+                        r["text"][:600],
+                        title=f"[bold]#{i} {r['file']}:{r['start_line']} (score={r['score']:.3f})[/bold]",
+                        border_style="blue"
+                    ))
+        except FileNotFoundError as e:
+            console.print(f"[red]❌ {e}[/red]")
+        except Exception as e:
+            console.print(f"[red]❌ Search error: {e}[/red]")
+        return
+
+    # ── GitHub Issue mode ─────────────────────────────────────────────────────
+    if args.issue is not None:
+        run_github_issue(args.issue, model, messages, args.pr, args)
+        save_history(messages, args.session)
+        console.print(f"\n[dim]{cost_summary()} · Issue #{args.issue} complete 🐙[/dim]")
+        return
+
+    # ── TUI mode ──────────────────────────────────────────────────────────────
+    if args.tui:
+        run_tui(model, messages, args.session, args)
+        return
 
     # ── Orchestrator mode ─────────────────────────────────────────────────────
     if args.orchestrate:
