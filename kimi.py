@@ -1046,14 +1046,33 @@ def run_agent(messages, model, max_iterations=20, extra_tools=None, extra_dispat
         tool_calls_raw = {}
 
         try:
-            response = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                tools=tools_to_use,
-                tool_choice="auto",
-                max_tokens=8192,
-                stream=False,
-            )
+            # Show spinner while waiting for API
+            spinner_frames = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]
+            spinner_labels = [
+                "Kimi is thinking", "Analyzing", "Processing",
+                "Working on it", "Almost there"
+            ]
+            label = spinner_labels[i % len(spinner_labels)]
+
+            if not quiet:
+                with console.status(f"[cyan]{label}...[/cyan]", spinner="dots"):
+                    response = client.chat.completions.create(
+                        model=model,
+                        messages=messages,
+                        tools=tools_to_use,
+                        tool_choice="auto",
+                        max_tokens=8192,
+                        stream=False,
+                    )
+            else:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    tools=tools_to_use,
+                    tool_choice="auto",
+                    max_tokens=8192,
+                    stream=False,
+                )
 
             msg = response.choices[0].message
             collected = msg.content or ""
@@ -1064,8 +1083,8 @@ def run_agent(messages, model, max_iterations=20, extra_tools=None, extra_dispat
 
             # Parse tool calls
             if msg.tool_calls:
-                for i, tc in enumerate(msg.tool_calls):
-                    tool_calls_raw[i] = {
+                for idx, tc in enumerate(msg.tool_calls):
+                    tool_calls_raw[idx] = {
                         "id":   tc.id,
                         "name": tc.function.name,
                         "args": tc.function.arguments,
@@ -1116,10 +1135,15 @@ def run_agent(messages, model, max_iterations=20, extra_tools=None, extra_dispat
                     for k, v in display_args["values"].items()
                 }
 
-            if not quiet:
-                console.print(f"\n[dim cyan]🔧 {name}({', '.join(f'{k}={repr(v)[:60]}' for k,v in display_args.items())})[/dim cyan]")
+            tool_label = f"🔧 {name}({', '.join(f'{k}={repr(v)[:40]}' for k,v in list(display_args.items())[:3])})"
 
-            result = execute_tool(name, args, extra_dispatch=extra_dispatch)
+            if not quiet:
+                console.print(f"\n[dim cyan]{tool_label}[/dim cyan]")
+                with console.status(f"[dim]Running {name}...[/dim]", spinner="dots2"):
+                    result = execute_tool(name, args, extra_dispatch=extra_dispatch)
+            else:
+                result = execute_tool(name, args, extra_dispatch=extra_dispatch)
+
             short = str(result)[:200] + "..." if len(str(result)) > 200 else str(result)
             if not quiet:
                 console.print(f"[dim]   → {short}[/dim]")
