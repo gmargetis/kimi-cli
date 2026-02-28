@@ -3,6 +3,17 @@ set -e
 
 echo "🤖 Installing Kimi CLI..."
 
+# On macOS: ensure python3 is working (reinstall if broken)
+if [[ "$(uname)" == "Darwin" ]]; then
+    if ! python3 --version &>/dev/null 2>&1; then
+        echo "🔧 python3 not working, installing via brew..."
+        /opt/homebrew/bin/brew install python@3.13 2>/dev/null || brew install python@3.13
+    elif [[ "$(wc -c < /opt/homebrew/Cellar/python@3.13/*/bin/python3 2>/dev/null | tr -d ' ')" == "0" ]]; then
+        echo "🔧 python3 binary is empty, reinstalling via brew..."
+        /opt/homebrew/bin/brew reinstall python@3.13
+    fi
+fi
+
 INSTALL_DIR="$HOME/.local/bin"
 mkdir -p "$INSTALL_DIR"
 
