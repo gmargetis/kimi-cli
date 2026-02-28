@@ -1934,12 +1934,28 @@ def main():
                         help="Build semantic search index for code files in workdir")
     parser.add_argument("--search", default=None, metavar="QUERY",
                         help="Semantic search over indexed code files")
+    parser.add_argument("--update", action="store_true",
+                        help="Update kimi to the latest version from GitHub")
     parser.add_argument("--tui", action="store_true",
                         help="Launch enhanced rich-based interactive TUI mode")
     args = parser.parse_args()
 
     # Model resolution
     model = MODELS.get(args.model, args.model)
+
+    # Self-update
+    if args.update:
+        repo_dir = Path(__file__).parent
+        console.print("[cyan]🔄 Updating Kimi CLI...[/cyan]")
+        result = subprocess.run(["git", "-C", str(repo_dir), "pull"], capture_output=True, text=True)
+        if result.returncode == 0:
+            out = result.stdout.strip()
+            console.print(f"[green]✅ {out}[/green]")
+            if out != "Already up to date.":
+                console.print("[dim]Restart kimi to use the new version.[/dim]")
+        else:
+            console.print(f"[red]❌ Update failed: {result.stderr.strip()}[/red]")
+        return
 
     # History
     if args.clear:
@@ -2111,6 +2127,18 @@ def main():
                 continue
             if user_input.lower() == "sessions":
                 console.print(list_sessions())
+                continue
+            if user_input.lower() == "update":
+                repo_dir = Path(__file__).parent
+                console.print("[cyan]🔄 Updating Kimi CLI...[/cyan]")
+                r = subprocess.run(["git", "-C", str(repo_dir), "pull"], capture_output=True, text=True)
+                out = r.stdout.strip()
+                if r.returncode == 0:
+                    console.print(f"[green]✅ {out}[/green]")
+                    if out != "Already up to date.":
+                        console.print("[dim]Restart kimi to use the new version.[/dim]")
+                else:
+                    console.print(f"[red]❌ {r.stderr.strip()}[/red]")
                 continue
             if not user_input.strip():
                 continue
