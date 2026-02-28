@@ -959,7 +959,13 @@ def run_agent(messages, model, max_iterations=20, extra_tools=None, extra_dispat
     turn_tokens["input"] = 0
     turn_tokens["output"] = 0
 
-    tools_to_use = TOOLS + (extra_tools or [])
+    # Core tools only — keeps prompt small and avoids timeout with large tool lists
+    CORE_TOOLS = [t for t in TOOLS if t["function"]["name"] in (
+        "read_file","write_file","edit_file","run_command","list_files",
+        "search_in_files","git_command","ssh_run","ssh_read_file","ssh_write_file",
+        "fetch_url","semantic_search"
+    )]
+    tools_to_use = (extra_tools or CORE_TOOLS)
 
     for i in range(max_iterations):
         if interrupted:
