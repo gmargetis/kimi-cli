@@ -3,11 +3,9 @@ set -e
 
 echo "🤖 Installing Kimi CLI..."
 
-# Install to ~/.local/bin
 INSTALL_DIR="$HOME/.local/bin"
 mkdir -p "$INSTALL_DIR"
 
-# Clone or update
 REPO_DIR="$HOME/.kimi-cli"
 if [ -d "$REPO_DIR" ]; then
     echo "📦 Updating..."
@@ -17,30 +15,33 @@ else
     git clone https://github.com/gmargetis/kimi-cli.git "$REPO_DIR"
 fi
 
-# Install dependencies — use brew python on macOS if available
+# Find correct python3
 if [[ "$(uname)" == "Darwin" ]]; then
-    PYTHON="$(brew --prefix 2>/dev/null)/bin/python3"
+    BREW_PREFIX="$(brew --prefix 2>/dev/null || echo /opt/homebrew)"
+    PYTHON="$BREW_PREFIX/bin/python3"
     if [[ ! -x "$PYTHON" ]]; then
-        PYTHON="python3"
+        PYTHON="$(which python3)"
     fi
 else
-    PYTHON="python3"
+    PYTHON="$(which python3)"
 fi
 
+echo "🐍 Using Python: $PYTHON"
 "$PYTHON" -m pip install -r "$REPO_DIR/requirements.txt" -q
 
-# Create wrapper script
-cat > "$INSTALL_DIR/kimi" << WRAPPER
+# Create wrapper with hardcoded python path
+cat > "$INSTALL_DIR/kimi" << EOF
 #!/usr/bin/env bash
-exec "$PYTHON" "\$HOME/.kimi-cli/kimi.py" "\$@"
-WRAPPER
+exec "$PYTHON" "$REPO_DIR/kimi.py" "\$@"
+EOF
 chmod +x "$INSTALL_DIR/kimi"
 
 # Check PATH
 if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
     echo ""
-    echo "⚠️  Add this to your ~/.bashrc or ~/.zshrc:"
+    echo "⚠️  Add this to your ~/.zshrc or ~/.bashrc:"
     echo "   export PATH=\"\$HOME/.local/bin:\$PATH\""
+    echo "   Then run: source ~/.zshrc"
 fi
 
 echo ""
