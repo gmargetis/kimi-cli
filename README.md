@@ -55,16 +55,63 @@ python3 kimi.py -i https://example.com/diagram.png "explain this architecture"
 
 # Skip task planning
 python3 kimi.py --no-plan "build a REST API"
+
+# Multi-agent orchestration mode
+python3 kimi.py --orchestrate "add authentication to this Express app"
+python3 kimi.py -O -w ~/myproject "fix all TypeScript errors"
+python3 kimi.py -O --workers 6 "migrate from JavaScript to TypeScript"
 ```
 
 ## Models
 
-| Alias  | Model                              | Best for             |
-|--------|------------------------------------|----------------------|
-| fast   | moonshotai/kimi-k2-instruct        | Most tasks (default) |
-| smart  | moonshotai/kimi-k2.5               | Complex analysis     |
-| think  | moonshotai/kimi-k2-thinking        | Hard problems        |
-| latest | moonshotai/kimi-k2-instruct-0905   | Latest version       |
+| Alias        | Model                              | Best for                      |
+|--------------|------------------------------------|-------------------------------|
+| fast         | moonshotai/kimi-k2-instruct        | Most tasks (default)          |
+| smart        | moonshotai/kimi-k2.5               | Complex analysis              |
+| think        | moonshotai/kimi-k2-thinking        | Hard problems                 |
+| latest       | moonshotai/kimi-k2-instruct-0905   | Latest version                |
+| orchestrator | moonshotai/kimi-k2.5               | Planning & aggregating tasks  |
+
+## 🎯 Orchestrator Mode (Multi-Agent)
+
+Orchestrator mode decomposes complex tasks into parallelizable subtasks, runs them with multiple worker agents, and synthesizes the results.
+
+```bash
+# Basic orchestration
+kimi --orchestrate "add authentication to this Express app"
+
+# Orchestrate in a specific project directory
+kimi -O -w ~/myproject "fix all TypeScript errors"
+
+# Control parallelism (default: 4 workers, max: 8)
+kimi -O --workers 6 "migrate from JavaScript to TypeScript"
+```
+
+### How it works
+
+1. **Planner** (`kimi-k2.5`) decomposes the task into up to 10 subtasks with dependency info
+2. **Worker pool** runs independent subtasks in parallel using `concurrent.futures.ThreadPoolExecutor`
+3. **Dependency resolution** — subtasks wait for their dependencies before starting (topological sort)
+4. **Dynamic spawning** — the orchestrator can spawn additional workers mid-execution via `spawn_worker` tool
+5. **Aggregator** (`kimi-k2.5`) synthesizes all worker results into a final summary
+
+### Live progress display
+
+```
+🎯 Orchestrating: "refactor auth module"
+
+Plan:
+  ✅ [1] Analyze current auth code
+  ✅ [2] Identify security issues
+  ⚡ [3] Write new auth module
+  ⚡ [4] Update tests
+  ⏳ [5] Update imports across codebase (needs: [3])
+```
+
+### Features
+- **Thread-safe file access** — per-file locks prevent concurrent write conflicts
+- **Fallback** — if planner fails, runs as a single task
+- **Max 10 subtasks** — larger tasks are capped automatically
 
 ## Features
 
@@ -76,6 +123,12 @@ python3 kimi.py --no-plan "build a REST API"
 - 💾 **History** — persistent context across sessions (`--resume`)
 - 🧠 **Project context** — auto-reads README/package.json for context
 - 💬 **Token tracking** — shows usage and estimated cost after each turn
+
+### New in v3
+- 🎯 **Orchestrator mode** — `--orchestrate` / `-O` for multi-agent parallel task execution
+- 👥 **Worker pool** — `--workers N` (default 4, max 8) to control parallelism
+- 🔒 **File locking** — concurrent worker writes to the same file are safely serialized
+- 🌱 **Dynamic spawn** — orchestrator can create extra workers mid-execution via `spawn_worker` tool
 
 ### New in v2
 - 🔀 **Git integration** — run git commands (status, diff, log, commit, push, etc.) as a tool

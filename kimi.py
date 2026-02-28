@@ -7,6 +7,8 @@ Usage:
   python3 kimi.py --model kimi-k2-thinking "hard task"
   python3 kimi.py --session myproject     # named session
   python3 kimi.py --image screenshot.png "what's in this image?"
+  python3 kimi.py --orchestrate "build auth module"  # multi-agent orchestration
+  python3 kimi.py -O "fix all TypeScript errors"     # orchestrate shorthand
 """
 
 import os
@@ -21,6 +23,8 @@ import tempfile
 import base64
 import glob as glob_module
 import re
+import threading
+import concurrent.futures
 from pathlib import Path
 from datetime import datetime
 from urllib import request as urllib_request
@@ -50,11 +54,23 @@ SSH_HOSTS = {
 }
 
 MODELS = {
-    "fast":    "moonshotai/kimi-k2-instruct",
-    "smart":   "moonshotai/kimi-k2.5",
-    "think":   "moonshotai/kimi-k2-thinking",
-    "latest":  "moonshotai/kimi-k2-instruct-0905",
+    "fast":         "moonshotai/kimi-k2-instruct",
+    "smart":        "moonshotai/kimi-k2.5",
+    "think":        "moonshotai/kimi-k2-thinking",
+    "latest":       "moonshotai/kimi-k2-instruct-0905",
+    "orchestrator": "moonshotai/kimi-k2.5",
 }
+
+# ── File locks for orchestrator (one lock per file path) ──────────────────────
+_file_locks: dict = {}
+_file_locks_mutex = threading.Lock()
+
+def get_file_lock(path: str) -> threading.Lock:
+    """Return (or create) a per-file lock to serialize concurrent writes."""
+    with _file_locks_mutex:
+        if path not in _file_locks:
+            _file_locks[path] = threading.Lock()
+        return _file_locks[path]
 
 # Kimi K2 pricing via NVIDIA NIM (per 1k tokens)
 COST_PER_1K_INPUT  = 0.015
@@ -376,33 +392,39 @@ def write_file(path, content):
     try:
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
-        # Save to undo stack if file exists
-        if p.exists():
-            push_undo(p, p.read_text(encoding="utf-8"))
-        p.write_text(content, encoding="utf-8")
+        # Serialize concurrent writes to the same file
+        lock = get_file_lock(str(p.resolve()))
+        with lock:
+            # Save to undo stack if file exists
+            if p.exists():
+                push_undo(p, p.read_text(encoding="utf-8"))
+            p.write_text(content, encoding="utf-8")
         return f"✅ Written {len(content)} chars to {path}"
     except Exception as e:
         return f"❌ Error: {e}"
 
 def edit_file(path, old_text, new_text):
     try:
-        content = Path(path).read_text(encoding="utf-8")
-        if old_text not in content:
-            return f"❌ Text not found in {path}"
-        # Save to undo stack
-        push_undo(path, content)
-        # Show diff
-        old_lines = old_text.splitlines()
-        new_lines = new_text.splitlines()
-        console.print(f"[dim]  📝 Diff in {path}:[/dim]")
-        for line in old_lines[:5]:
-            console.print(f"[dim red]  - {line}[/dim red]")
-        for line in new_lines[:5]:
-            console.print(f"[dim green]  + {line}[/dim green]")
-        if len(old_lines) > 5:
-            console.print(f"[dim]  ... ({len(old_lines)} lines total)[/dim]")
-        new_content = content.replace(old_text, new_text, 1)
-        Path(path).write_text(new_content, encoding="utf-8")
+        p = Path(path)
+        lock = get_file_lock(str(p.resolve()))
+        with lock:
+            content = p.read_text(encoding="utf-8")
+            if old_text not in content:
+                return f"❌ Text not found in {path}"
+            # Save to undo stack
+            push_undo(path, content)
+            # Show diff
+            old_lines = old_text.splitlines()
+            new_lines = new_text.splitlines()
+            console.print(f"[dim]  📝 Diff in {path}:[/dim]")
+            for line in old_lines[:5]:
+                console.print(f"[dim red]  - {line}[/dim red]")
+            for line in new_lines[:5]:
+                console.print(f"[dim green]  + {line}[/dim green]")
+            if len(old_lines) > 5:
+                console.print(f"[dim]  ... ({len(old_lines)} lines total)[/dim]")
+            new_content = content.replace(old_text, new_text, 1)
+            p.write_text(new_content, encoding="utf-8")
         return f"✅ Edited {path}"
     except Exception as e:
         return f"❌ Error: {e}"
@@ -670,12 +692,14 @@ def edit_files_glob(pattern, old_text, new_text):
         if not p.is_file():
             continue
         try:
-            content = p.read_text(encoding="utf-8")
-            if old_text in content:
-                push_undo(filepath, content)
-                new_content = content.replace(old_text, new_text)
-                p.write_text(new_content, encoding="utf-8")
-                changed.append(filepath)
+            lock = get_file_lock(str(p.resolve()))
+            with lock:
+                content = p.read_text(encoding="utf-8")
+                if old_text in content:
+                    push_undo(filepath, content)
+                    new_content = content.replace(old_text, new_text)
+                    p.write_text(new_content, encoding="utf-8")
+                    changed.append(filepath)
         except Exception as e:
             errors.append(f"{filepath}: {e}")
     result = f"✅ Changed {len(changed)} files:\n" + "\n".join(changed)
@@ -685,7 +709,7 @@ def edit_files_glob(pattern, old_text, new_text):
         result = f"ℹ️ No files matched pattern '{pattern}' or text not found"
     return result
 
-def execute_tool(name, args):
+def execute_tool(name, args, extra_dispatch=None):
     dispatch = {
         "read_file":       lambda: read_file(args["path"], args.get("lines_from"), args.get("lines_to")),
         "write_file":      lambda: write_file(args["path"], args["content"]),
@@ -707,6 +731,8 @@ def execute_tool(name, args):
         "write_env":       lambda: write_env(args["values"], args.get("path", ".env")),
         "edit_files_glob": lambda: edit_files_glob(args["pattern"], args["old_text"], args["new_text"]),
     }
+    if extra_dispatch:
+        dispatch.update(extra_dispatch)
     fn = dispatch.get(name)
     return fn() if fn else f"Unknown tool: {name}"
 
@@ -874,11 +900,26 @@ def save_session_markdown(messages):
     return filename
 
 # ── Agentic loop (with streaming) ─────────────────────────────────────────────
-def run_agent(messages, model, max_iterations=20):
+def run_agent(messages, model, max_iterations=20, extra_tools=None, extra_dispatch=None,
+              quiet=False):
+    """
+    Run the agentic loop.
+
+    Args:
+        messages:       Conversation history (mutated in place).
+        model:          Model name to use.
+        max_iterations: Maximum tool-call iterations before giving up.
+        extra_tools:    Additional tool definitions to inject.
+        extra_dispatch: Dict mapping tool name → callable for extra tools.
+        quiet:          Suppress live streaming output (used by worker agents).
+    """
     global interrupted
-    interrupted = False
+    if not quiet:
+        interrupted = False
     turn_tokens["input"] = 0
     turn_tokens["output"] = 0
+
+    tools_to_use = TOOLS + (extra_tools or [])
 
     for i in range(max_iterations):
         if interrupted:
@@ -892,42 +933,62 @@ def run_agent(messages, model, max_iterations=20):
             stream = client.chat.completions.create(
                 model=model,
                 messages=messages,
-                tools=TOOLS,
+                tools=tools_to_use,
                 tool_choice="auto",
                 max_tokens=8192,
                 stream=True,
             )
 
-            with Live(console=console, refresh_per_second=15) as live:
-                for chunk in stream:
-                    if interrupted:
-                        break
-                    delta = chunk.choices[0].delta if chunk.choices else None
-                    if not delta:
-                        continue
+            def _process_stream(stream):
+                nonlocal collected
+                if quiet:
+                    for chunk in stream:
+                        delta = chunk.choices[0].delta if chunk.choices else None
+                        if not delta:
+                            continue
+                        if delta.content:
+                            collected += delta.content
+                        if delta.tool_calls:
+                            for tc in delta.tool_calls:
+                                idx = tc.index
+                                if idx not in tool_calls_raw:
+                                    tool_calls_raw[idx] = {"id": "", "name": "", "args": ""}
+                                if tc.id:
+                                    tool_calls_raw[idx]["id"] = tc.id
+                                if tc.function:
+                                    if tc.function.name:
+                                        tool_calls_raw[idx]["name"] += tc.function.name
+                                    if tc.function.arguments:
+                                        tool_calls_raw[idx]["args"] += tc.function.arguments
+                        if hasattr(chunk, "usage") and chunk.usage:
+                            track_tokens(chunk.usage)
+                else:
+                    with Live(console=console, refresh_per_second=15) as live:
+                        for chunk in stream:
+                            if interrupted:
+                                break
+                            delta = chunk.choices[0].delta if chunk.choices else None
+                            if not delta:
+                                continue
+                            if delta.content:
+                                collected += delta.content
+                                live.update(Text(collected))
+                            if delta.tool_calls:
+                                for tc in delta.tool_calls:
+                                    idx = tc.index
+                                    if idx not in tool_calls_raw:
+                                        tool_calls_raw[idx] = {"id": "", "name": "", "args": ""}
+                                    if tc.id:
+                                        tool_calls_raw[idx]["id"] = tc.id
+                                    if tc.function:
+                                        if tc.function.name:
+                                            tool_calls_raw[idx]["name"] += tc.function.name
+                                        if tc.function.arguments:
+                                            tool_calls_raw[idx]["args"] += tc.function.arguments
+                            if hasattr(chunk, "usage") and chunk.usage:
+                                track_tokens(chunk.usage)
 
-                    # Text streaming
-                    if delta.content:
-                        collected += delta.content
-                        live.update(Text(collected))
-
-                    # Tool call streaming
-                    if delta.tool_calls:
-                        for tc in delta.tool_calls:
-                            idx = tc.index
-                            if idx not in tool_calls_raw:
-                                tool_calls_raw[idx] = {"id": "", "name": "", "args": ""}
-                            if tc.id:
-                                tool_calls_raw[idx]["id"] = tc.id
-                            if tc.function:
-                                if tc.function.name:
-                                    tool_calls_raw[idx]["name"] += tc.function.name
-                                if tc.function.arguments:
-                                    tool_calls_raw[idx]["args"] += tc.function.arguments
-
-                    # Track usage
-                    if hasattr(chunk, "usage") and chunk.usage:
-                        track_tokens(chunk.usage)
+            _process_stream(stream)
 
         except Exception as e:
             return f"❌ API Error: {e}"
@@ -970,11 +1031,13 @@ def run_agent(messages, model, max_iterations=20):
                     for k, v in display_args["values"].items()
                 }
 
-            console.print(f"\n[dim cyan]🔧 {name}({', '.join(f'{k}={repr(v)[:60]}' for k,v in display_args.items())})[/dim cyan]")
+            if not quiet:
+                console.print(f"\n[dim cyan]🔧 {name}({', '.join(f'{k}={repr(v)[:60]}' for k,v in display_args.items())})[/dim cyan]")
 
-            result = execute_tool(name, args)
+            result = execute_tool(name, args, extra_dispatch=extra_dispatch)
             short = str(result)[:200] + "..." if len(str(result)) > 200 else str(result)
-            console.print(f"[dim]   → {short}[/dim]")
+            if not quiet:
+                console.print(f"[dim]   → {short}[/dim]")
 
             messages.append({
                 "role": "tool",
@@ -1003,6 +1066,366 @@ Be concise. Show diffs when editing. Verify your changes work."""
         base += f"\n\n## Project Context\n{project_ctx}"
     return base
 
+# ── Orchestrator mode ─────────────────────────────────────────────────────────
+
+MAX_SUBTASKS = 10
+
+ORCHESTRATOR_PLANNER_SYSTEM = """You are an expert task orchestrator. Your job is to decompose a complex task into smaller, parallelizable subtasks.
+
+Output ONLY valid JSON (no markdown fences, no explanation) in this exact format:
+{
+  "subtasks": [
+    {
+      "id": 1,
+      "title": "Short title",
+      "description": "Detailed description of what to do",
+      "dependencies": []
+    },
+    {
+      "id": 2,
+      "title": "Another subtask",
+      "description": "...",
+      "dependencies": [1]
+    }
+  ]
+}
+
+Rules:
+- Maximum """ + str(MAX_SUBTASKS) + """ subtasks
+- dependencies is a list of subtask ids that must complete BEFORE this one starts
+- Maximize parallelism: tasks with no shared dependencies can run simultaneously
+- Each subtask should be self-contained and actionable
+- Be specific: include filenames, function names, etc. when known
+- If the task is simple (1-2 steps), use 1-2 subtasks"""
+
+ORCHESTRATOR_AGGREGATOR_SYSTEM = """You are an expert at synthesizing results from parallel worker agents.
+
+You will receive the original task and the results from multiple worker agents that each handled a subtask.
+Your job is to:
+1. Synthesize a clear, concise summary of what was accomplished
+2. Highlight any conflicts, issues, or incomplete work
+3. Suggest follow-up steps if needed
+
+Be direct and actionable."""
+
+# spawn_worker tool definition (for orchestrator to dynamically create subtasks)
+SPAWN_WORKER_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "spawn_worker",
+        "description": "Dynamically spawn an additional worker agent to handle a new subtask that wasn't in the original plan. Use this when you discover additional work that needs to be done.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "Short title for the subtask"},
+                "description": {"type": "string", "description": "Detailed description of what the worker should do"},
+                "context": {"type": "string", "description": "Any additional context or results from previous workers that this worker needs"}
+            },
+            "required": ["title", "description"]
+        }
+    }
+}
+
+
+def _topological_sort(subtasks: list) -> list:
+    """Return subtasks in topological order (dependencies first)."""
+    id_to_task = {t["id"]: t for t in subtasks}
+    visited = set()
+    result = []
+
+    def visit(task_id):
+        if task_id in visited:
+            return
+        visited.add(task_id)
+        for dep in id_to_task.get(task_id, {}).get("dependencies", []):
+            visit(dep)
+        result.append(id_to_task[task_id])
+
+    for task in subtasks:
+        visit(task["id"])
+    return result
+
+
+def _render_orchestrator_status(task: str, subtasks: list, running: set, done: set, failed: set):
+    """Render a progress view of the orchestration."""
+    lines = [f"[bold cyan]🎯 Orchestrating:[/bold cyan] [bold]\"{task}\"[/bold]\n"]
+    lines.append("[bold]Plan:[/bold]")
+    for st in subtasks:
+        sid = st["id"]
+        title = st["title"]
+        if sid in done:
+            lines.append(f"  [green]✅ [{sid}] {title}[/green]")
+        elif sid in failed:
+            lines.append(f"  [red]❌ [{sid}] {title}[/red]")
+        elif sid in running:
+            lines.append(f"  [yellow]⚡ [{sid}] {title}[/yellow]")
+        else:
+            deps = st.get("dependencies", [])
+            if deps:
+                lines.append(f"  [dim]⏳ [{sid}] {title} (needs: {deps})[/dim]")
+            else:
+                lines.append(f"  [dim]⏳ [{sid}] {title}[/dim]")
+    return "\n".join(lines)
+
+
+def run_worker(subtask: dict, original_task: str, system_content: str,
+               model: str, dep_results: dict) -> dict:
+    """Run a single worker agent for a subtask. Returns result dict."""
+    sid = subtask["id"]
+    title = subtask["title"]
+    desc = subtask["description"]
+
+    # Build worker system + context
+    worker_system = (
+        f"{system_content}\n\n"
+        f"## Orchestration Context\n"
+        f"You are Worker #{sid} in a multi-agent orchestration system.\n"
+        f"Overall task: {original_task}\n"
+        f"Your specific subtask: {title}\n"
+    )
+
+    if dep_results:
+        worker_system += "\n## Results from prerequisite subtasks:\n"
+        for dep_id, dep_result in dep_results.items():
+            worker_system += f"\n### Subtask {dep_id} result:\n{dep_result}\n"
+
+    worker_messages = [
+        {"role": "system", "content": worker_system},
+        {"role": "user", "content": f"Please complete this subtask:\n\n{desc}"}
+    ]
+
+    try:
+        result = run_agent(worker_messages, model, max_iterations=15, quiet=True)
+        return {"id": sid, "title": title, "status": "done", "result": result}
+    except Exception as e:
+        return {"id": sid, "title": title, "status": "failed", "result": str(e)}
+
+
+def run_orchestrator(task: str, system_content: str, orchestrator_model: str,
+                     worker_model: str, max_workers: int = 4):
+    """
+    Main orchestration loop:
+    1. Plan: decompose task into subtasks
+    2. Execute: run subtasks in parallel respecting dependencies
+    3. Aggregate: synthesize results
+    """
+    console.print(Panel(
+        f"[bold cyan]🎯 Kimi Orchestrator[/bold cyan]\n"
+        f"[dim]Planner: {orchestrator_model}\nWorker: {worker_model}\nMax workers: {max_workers}[/dim]",
+        border_style="cyan"
+    ))
+    console.print(f"\n[bold]Task:[/bold] {task}\n")
+
+    # ── Step 1: Plan ──────────────────────────────────────────────────────────
+    console.print("[dim cyan]📋 Planning task decomposition...[/dim cyan]")
+    plan_messages = [
+        {"role": "system", "content": ORCHESTRATOR_PLANNER_SYSTEM},
+        {"role": "user", "content": f"Task: {task}\n\nWorking directory context:\n{system_content[:1000]}"}
+    ]
+
+    subtasks = []
+    try:
+        # Try orchestrator model first, fall back to fast
+        for attempt_model in [orchestrator_model, MODELS["fast"]]:
+            try:
+                resp = client.chat.completions.create(
+                    model=attempt_model,
+                    messages=plan_messages,
+                    max_tokens=2048,
+                    stream=False,
+                )
+                if resp.usage:
+                    track_tokens(resp.usage)
+                raw = resp.choices[0].message.content.strip()
+
+                # Strip markdown fences if present
+                raw = re.sub(r'^```(?:json)?\s*', '', raw, flags=re.MULTILINE)
+                raw = re.sub(r'\s*```$', '', raw, flags=re.MULTILINE)
+
+                plan_data = json.loads(raw)
+                subtasks = plan_data.get("subtasks", [])
+                if subtasks:
+                    break
+            except (json.JSONDecodeError, Exception) as e:
+                console.print(f"[yellow]⚠️ Plan attempt failed with {attempt_model}: {e}[/yellow]")
+                continue
+
+        if not subtasks:
+            console.print("[red]❌ Could not generate a plan. Running as single task.[/red]")
+            # Fallback: single subtask
+            subtasks = [{"id": 1, "title": task[:60], "description": task, "dependencies": []}]
+
+        # Clamp to max subtasks
+        if len(subtasks) > MAX_SUBTASKS:
+            console.print(f"[yellow]⚠️ Plan has {len(subtasks)} subtasks (max {MAX_SUBTASKS}), truncating.[/yellow]")
+            subtasks = subtasks[:MAX_SUBTASKS]
+
+    except Exception as e:
+        console.print(f"[red]❌ Planner error: {e}[/red]")
+        subtasks = [{"id": 1, "title": task[:60], "description": task, "dependencies": []}]
+
+    # ── Display plan ──────────────────────────────────────────────────────────
+    plan_lines = [f"[bold]📋 Plan ({len(subtasks)} subtasks):[/bold]"]
+    for st in subtasks:
+        deps = st.get("dependencies", [])
+        dep_str = f" [dim](after {deps})[/dim]" if deps else ""
+        plan_lines.append(f"  [{st['id']}] {st['title']}{dep_str}")
+    console.print("\n".join(plan_lines))
+    console.print()
+
+    # ── Step 2: Execute with dependency resolution ────────────────────────────
+    sorted_tasks = _topological_sort(subtasks)
+    id_to_task = {t["id"]: t for t in subtasks}
+
+    running: set = set()
+    done: set = set()
+    failed: set = set()
+    results: dict = {}  # id → result string
+    pending_futures: dict = {}  # future → subtask id
+
+    # For dynamic spawn_worker calls from orchestrator
+    dynamic_tasks = []
+    dynamic_lock = threading.Lock()
+    next_dynamic_id = [max(t["id"] for t in subtasks) + 1]
+
+    def spawn_worker_fn(title: str, description: str, context: str = "") -> str:
+        """Called when orchestrator wants to dynamically spawn a new worker."""
+        with dynamic_lock:
+            new_id = next_dynamic_id[0]
+            next_dynamic_id[0] += 1
+        new_task = {
+            "id": new_id,
+            "title": title,
+            "description": description + (f"\n\nContext:\n{context}" if context else ""),
+            "dependencies": list(done),  # depends on all completed tasks
+        }
+        with dynamic_lock:
+            dynamic_tasks.append(new_task)
+            sorted_tasks.append(new_task)
+            id_to_task[new_id] = new_task
+            subtasks.append(new_task)
+        console.print(f"[cyan]  ➕ Dynamically spawned worker [{new_id}]: {title}[/cyan]")
+        return f"✅ Spawned worker [{new_id}]: {title}"
+
+    def can_run(subtask_item):
+        return all(dep in done for dep in subtask_item.get("dependencies", []))
+
+    import time as _time
+
+    with Live(console=console, refresh_per_second=4) as live:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            processed = set()
+
+            while True:
+                # Find tasks ready to run
+                for subtask_item in list(sorted_tasks):
+                    tid = subtask_item["id"]
+                    if tid in done or tid in failed or tid in running or tid in processed:
+                        continue
+                    if can_run(subtask_item):
+                        running.add(tid)
+                        processed.add(tid)
+                        dep_results = {
+                            dep: results[dep]
+                            for dep in subtask_item.get("dependencies", [])
+                            if dep in results
+                        }
+                        future = executor.submit(
+                            run_worker, subtask_item, task, system_content, worker_model, dep_results
+                        )
+                        pending_futures[future] = tid
+
+                # Update display
+                live.update(Text.from_markup(
+                    _render_orchestrator_status(task, subtasks, running, done, failed)
+                ))
+
+                if not pending_futures:
+                    if all(t["id"] in done or t["id"] in failed for t in sorted_tasks):
+                        break
+                    # Check for dynamic tasks that appeared
+                    with dynamic_lock:
+                        new_dynamic = [t for t in dynamic_tasks if t["id"] not in processed and can_run(t)]
+                    if not new_dynamic:
+                        break
+                    _time.sleep(0.25)
+                    continue
+
+                # Wait for any future to complete
+                done_futures, _ = concurrent.futures.wait(
+                    list(pending_futures.keys()),
+                    timeout=0.5,
+                    return_when=concurrent.futures.FIRST_COMPLETED
+                )
+
+                for future in done_futures:
+                    tid = pending_futures.pop(future)
+                    running.discard(tid)
+                    try:
+                        worker_result = future.result()
+                        results[tid] = worker_result.get("result", "")
+                        if worker_result.get("status") == "done":
+                            done.add(tid)
+                        else:
+                            failed.add(tid)
+                    except Exception as e:
+                        failed.add(tid)
+                        results[tid] = f"❌ Worker crashed: {e}"
+
+                # Refresh display with updated task list
+                live.update(Text.from_markup(
+                    _render_orchestrator_status(task, subtasks, running, done, failed)
+                ))
+
+    # Final status line
+    console.print()
+    status_parts = []
+    if done:
+        status_parts.append(f"[green]✅ {len(done)} completed[/green]")
+    if failed:
+        status_parts.append(f"[red]❌ {len(failed)} failed[/red]")
+    console.print("  ".join(status_parts))
+    console.print()
+
+    # ── Step 3: Aggregate ─────────────────────────────────────────────────────
+    console.print("[dim cyan]🧠 Synthesizing results...[/dim cyan]\n")
+
+    agg_content = f"Original task: {task}\n\nWorker results:\n\n"
+    for st in subtasks:
+        sid = st["id"]
+        status_emoji = "✅" if sid in done else "❌"
+        agg_content += f"## {status_emoji} Subtask {sid}: {st['title']}\n"
+        agg_content += f"{results.get(sid, 'No result')}\n\n"
+
+    agg_messages = [
+        {"role": "system", "content": ORCHESTRATOR_AGGREGATOR_SYSTEM},
+        {"role": "user", "content": agg_content}
+    ]
+
+    try:
+        agg_resp = client.chat.completions.create(
+            model=orchestrator_model,
+            messages=agg_messages,
+            max_tokens=4096,
+            stream=True,
+        )
+        final_summary = ""
+        with Live(console=console, refresh_per_second=15) as live:
+            for chunk in agg_resp:
+                delta = chunk.choices[0].delta if chunk.choices else None
+                if delta and delta.content:
+                    final_summary += delta.content
+                    live.update(Text(final_summary))
+                if hasattr(chunk, "usage") and chunk.usage:
+                    track_tokens(chunk.usage)
+    except Exception as e:
+        final_summary = f"❌ Aggregation failed: {e}\n\nIndividual results:\n{agg_content}"
+        console.print(final_summary)
+
+    console.print()
+    return final_summary
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description="Kimi Coding CLI")
@@ -1015,6 +1438,10 @@ def main():
     parser.add_argument("--session", "-s", default=None, help="Named session (stored in ~/.kimi_sessions/)")
     parser.add_argument("--image", "-i", default=None, help="Image path or URL to send with prompt (vision)")
     parser.add_argument("--no-plan", action="store_true", help="Skip task planning step")
+    parser.add_argument("--orchestrate", "-O", metavar="TASK",
+                        help="Activate multi-agent orchestration mode for a complex task")
+    parser.add_argument("--workers", type=int, default=4,
+                        help="Number of parallel workers for orchestration (default: 4, max: 8)")
     args = parser.parse_args()
 
     # Model resolution
@@ -1093,6 +1520,23 @@ def main():
         )
         save_history(messages, args.session)
         return result
+
+    # ── Orchestrator mode ─────────────────────────────────────────────────────
+    if args.orchestrate:
+        orchestrate_task = args.orchestrate
+        orchestrator_model = MODELS["orchestrator"]
+        worker_model = MODELS["fast"]
+        max_workers = max(1, min(8, args.workers))
+        system_content = make_system_prompt(args.workdir, project_ctx)
+        run_orchestrator(
+            task=orchestrate_task,
+            system_content=system_content,
+            orchestrator_model=orchestrator_model,
+            worker_model=worker_model,
+            max_workers=max_workers,
+        )
+        console.print(f"\n[dim]{cost_summary()} · Orchestration complete 🎯[/dim]")
+        return
 
     if args.prompt:
         console.print(f"[bold]> {args.prompt}[/bold]\n")
