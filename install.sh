@@ -15,21 +15,12 @@ else
     git clone https://github.com/gmargetis/kimi-cli.git "$REPO_DIR"
 fi
 
-# Find correct python3
-if [[ "$(uname)" == "Darwin" ]]; then
-    BREW_PREFIX="$(brew --prefix 2>/dev/null || echo /opt/homebrew)"
-    PYTHON="$BREW_PREFIX/bin/python3"
-    if [[ ! -x "$PYTHON" ]]; then
-        PYTHON="$(which python3)"
-    fi
-else
-    PYTHON="$(which python3)"
-fi
-
+# Find correct python3 — resolve symlinks to get real path
+PYTHON="$(python3 -c 'import sys; print(sys.executable)' 2>/dev/null || which python3)"
 echo "🐍 Using Python: $PYTHON"
 "$PYTHON" -m pip install -r "$REPO_DIR/requirements.txt" -q
 
-# Create wrapper with hardcoded python path
+# Create wrapper using resolved real python path
 cat > "$INSTALL_DIR/kimi" << EOF
 #!/usr/bin/env bash
 exec "$PYTHON" "$REPO_DIR/kimi.py" "\$@"
