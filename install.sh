@@ -15,15 +15,24 @@ else
     git clone https://github.com/gmargetis/kimi-cli.git "$REPO_DIR"
 fi
 
-# Find correct python3 — resolve symlinks to get real path
-PYTHON="$(python3 -c 'import sys; print(sys.executable)' 2>/dev/null || which python3)"
-echo "🐍 Using Python: $PYTHON"
-"$PYTHON" -m pip install -r "$REPO_DIR/requirements.txt" -q
+# Install dependencies using the same python3 that's in PATH
+echo "📦 Installing Python dependencies..."
+python3 -m pip install -r "$REPO_DIR/requirements.txt" -q 2>/dev/null || \
+    pip3 install -r "$REPO_DIR/requirements.txt" -q 2>/dev/null || \
+    /opt/homebrew/bin/python3 -m pip install -r "$REPO_DIR/requirements.txt" -q
 
-# Create wrapper using resolved real python path
-cat > "$INSTALL_DIR/kimi" << EOF
-#!/usr/bin/env bash
-exec "$PYTHON" "$REPO_DIR/kimi.py" "\$@"
+# Create wrapper — use env to find python3 at runtime (avoids symlink issues)
+cat > "$INSTALL_DIR/kimi" << 'EOF'
+#!/bin/sh
+SCRIPT="$HOME/.kimi-cli/kimi.py"
+# Try python3 from common locations
+for PY in python3 /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
+    if command -v "$PY" &>/dev/null 2>&1; then
+        exec "$PY" "$SCRIPT" "$@"
+    fi
+done
+echo "❌ python3 not found"
+exit 1
 EOF
 chmod +x "$INSTALL_DIR/kimi"
 
