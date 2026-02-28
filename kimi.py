@@ -970,65 +970,34 @@ def run_agent(messages, model, max_iterations=20, extra_tools=None, extra_dispat
         tool_calls_raw = {}
 
         try:
-            stream = client.chat.completions.create(
+            response = client.chat.completions.create(
                 model=model,
                 messages=messages,
                 tools=tools_to_use,
                 tool_choice="auto",
                 max_tokens=8192,
-                stream=True,
+                stream=False,
             )
 
-            def _process_stream(stream):
-                nonlocal collected
-                if quiet:
-                    for chunk in stream:
-                        delta = chunk.choices[0].delta if chunk.choices else None
-                        if not delta:
-                            continue
-                        if delta.content:
-                            collected += delta.content
-                        if delta.tool_calls:
-                            for tc in delta.tool_calls:
-                                idx = tc.index
-                                if idx not in tool_calls_raw:
-                                    tool_calls_raw[idx] = {"id": "", "name": "", "args": ""}
-                                if tc.id:
-                                    tool_calls_raw[idx]["id"] = tc.id
-                                if tc.function:
-                                    if tc.function.name:
-                                        tool_calls_raw[idx]["name"] += tc.function.name
-                                    if tc.function.arguments:
-                                        tool_calls_raw[idx]["args"] += tc.function.arguments
-                        if hasattr(chunk, "usage") and chunk.usage:
-                            track_tokens(chunk.usage)
-                else:
-                    with Live(console=console, refresh_per_second=15) as live:
-                        for chunk in stream:
-                            if interrupted:
-                                break
-                            delta = chunk.choices[0].delta if chunk.choices else None
-                            if not delta:
-                                continue
-                            if delta.content:
-                                collected += delta.content
-                                live.update(Text(collected))
-                            if delta.tool_calls:
-                                for tc in delta.tool_calls:
-                                    idx = tc.index
-                                    if idx not in tool_calls_raw:
-                                        tool_calls_raw[idx] = {"id": "", "name": "", "args": ""}
-                                    if tc.id:
-                                        tool_calls_raw[idx]["id"] = tc.id
-                                    if tc.function:
-                                        if tc.function.name:
-                                            tool_calls_raw[idx]["name"] += tc.function.name
-                                        if tc.function.arguments:
-                                            tool_calls_raw[idx]["args"] += tc.function.arguments
-                            if hasattr(chunk, "usage") and chunk.usage:
-                                track_tokens(chunk.usage)
+            msg = response.choices[0].message
+            collected = msg.content or ""
 
-            _process_stream(stream)
+            # Display response
+            if collected and not quiet:
+                console.print(Markdown(collected))
+
+            # Parse tool calls
+            if msg.tool_calls:
+                for i, tc in enumerate(msg.tool_calls):
+                    tool_calls_raw[i] = {
+                        "id":   tc.id,
+                        "name": tc.function.name,
+                        "args": tc.function.arguments,
+                    }
+
+            # Track usage
+            if response.usage:
+                track_tokens(response.usage)
 
         except Exception as e:
             return f"❌ API Error: {e}"
@@ -1590,12 +1559,13 @@ CHUNK_SIZE = 60   # lines per chunk
 CHUNK_OVERLAP = 10
 
 
-def _embed(texts: list) -> list:
+def _embed(texts: list, input_type: str = "passage") -> list:
     """Call NVIDIA embeddings API and return list of float vectors."""
     payload = json.dumps({
         "model": EMBED_MODEL,
         "input": texts,
-        "encoding_format": "float"
+        "encoding_format": "float",
+        "input_type": input_type,
     }).encode("utf-8")
     req = urllib_request.Request(
         "https://integrate.api.nvidia.com/v1/embeddings",
@@ -1691,7 +1661,7 @@ def semantic_search(query: str, workdir: str = ".", top_k: int = 5) -> list:
         return []
 
     try:
-        query_embedding = _embed([query])[0]
+        query_embedding = _embed([query], input_type="query")[0]
     except Exception as e:
         raise RuntimeError(f"Could not embed query: {e}")
 
@@ -1957,8 +1927,6 @@ def main():
                 console.print()
 
         result = run_agent(messages, model)
-        if result:
-            console.print(Markdown(result))
         console.print()
 
         # Cost per turn
