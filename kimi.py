@@ -57,8 +57,67 @@ from rich.align import Align
 from rich import print as rprint
 
 # ── Config ────────────────────────────────────────────────────────────────────
-API_KEY  = os.environ.get("NVIDIA_API_KEY", "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")
-BASE_URL = "https://integrate.api.nvidia.com/v1"
+BASE_URL    = "https://integrate.api.nvidia.com/v1"
+CONFIG_FILE = Path.home() / ".kimi_config.json"
+
+def _load_config() -> dict:
+    if CONFIG_FILE.exists():
+        try:
+            return json.loads(CONFIG_FILE.read_text())
+        except:
+            pass
+    return {}
+
+def _save_config(data: dict):
+    CONFIG_FILE.write_text(json.dumps(data, indent=2))
+    CONFIG_FILE.chmod(0o600)  # readable only by owner
+
+def _test_api_key(key: str) -> bool:
+    """Quick test call to verify the key works."""
+    try:
+        c = OpenAI(api_key=key, base_url=BASE_URL)
+        c.chat.completions.create(
+            model="moonshotai/kimi-k2-instruct",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=5, stream=False
+        )
+        return True
+    except:
+        return False
+
+def _get_api_key() -> str:
+    """Get API key: env var → config file → prompt user."""
+    # 1. Env var
+    key = os.environ.get("NVIDIA_API_KEY", "").strip()
+    if key:
+        return key
+
+    # 2. Config file
+    cfg = _load_config()
+    key = cfg.get("nvidia_api_key", "").strip()
+    if key:
+        return key
+
+    # 3. Ask user
+    print("\n🔑 NVIDIA API key not found.")
+    print("   Get a free key at: https://build.nvidia.com")
+    print()
+    while True:
+        key = input("   Paste your NVIDIA_API_KEY: ").strip()
+        if not key:
+            print("   ❌ Key cannot be empty.")
+            continue
+        print("   🔄 Testing key...", end="", flush=True)
+        if _test_api_key(key):
+            print(" ✅ Works!")
+            cfg["nvidia_api_key"] = key
+            _save_config(cfg)
+            print(f"   💾 Saved to {CONFIG_FILE}\n")
+            return key
+        else:
+            print(" ❌ Invalid or expired key. Try again.")
+
+API_KEY = _get_api_key()
 HISTORY_FILE = Path.home() / ".kimi_history.pkl"
 SESSIONS_DIR = Path.home() / ".kimi_sessions"
 
