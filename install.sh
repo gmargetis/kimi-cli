@@ -17,14 +17,23 @@ else
     git clone https://github.com/gmargetis/kimi-cli.git "$REPO_DIR"
 fi
 
-# Install dependencies
-pip3 install -r "$REPO_DIR/requirements.txt" -q
+# Install dependencies — use brew python on macOS if available
+if [[ "$(uname)" == "Darwin" ]]; then
+    PYTHON="$(brew --prefix 2>/dev/null)/bin/python3"
+    if [[ ! -x "$PYTHON" ]]; then
+        PYTHON="python3"
+    fi
+else
+    PYTHON="python3"
+fi
+
+"$PYTHON" -m pip install -r "$REPO_DIR/requirements.txt" -q
 
 # Create wrapper script
-cat > "$INSTALL_DIR/kimi" << 'EOF'
+cat > "$INSTALL_DIR/kimi" << WRAPPER
 #!/usr/bin/env bash
-exec python3 "$HOME/.kimi-cli/kimi.py" "$@"
-EOF
+exec "$PYTHON" "\$HOME/.kimi-cli/kimi.py" "\$@"
+WRAPPER
 chmod +x "$INSTALL_DIR/kimi"
 
 # Check PATH
