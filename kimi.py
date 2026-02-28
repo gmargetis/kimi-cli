@@ -1,4 +1,15 @@
 #!/usr/bin/env python3
+# Auto-install dependencies on first run
+import subprocess, sys
+def _ensure_deps():
+    try:
+        import openai, rich
+    except ImportError:
+        print("📦 Installing dependencies...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "openai", "rich", "-q"])
+        print("✅ Done!\n")
+_ensure_deps()
+
 """
 Kimi CLI - Agentic coding assistant powered by Kimi via NVIDIA NIM
 Usage:
