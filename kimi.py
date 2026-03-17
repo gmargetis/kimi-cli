@@ -53,10 +53,15 @@ try:
     _rl_hist = __import__('pathlib').Path.home() / '.kimi_readline_history'
     try:
         readline.read_history_file(str(_rl_hist))
-    except FileNotFoundError:
+    except (FileNotFoundError, PermissionError, OSError):
         pass
     import atexit
-    atexit.register(readline.write_history_file, str(_rl_hist))
+    def _rl_save():
+        try:
+            readline.write_history_file(str(_rl_hist))
+        except (PermissionError, OSError):
+            pass
+    atexit.register(_rl_save)
     del _rl_hist
 except ImportError:
     pass  # readline not available (Windows)
