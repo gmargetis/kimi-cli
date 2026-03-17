@@ -525,7 +525,7 @@ def run_command(command, workdir=None):
     try:
         result = subprocess.run(
             command, shell=True, capture_output=True, text=True,
-            cwd=workdir or os.getcwd(), timeout=120
+            cwd=workdir or os.getcwd(), timeout=300
         )
         out = result.stdout.strip()
         err = result.stderr.strip()
@@ -536,15 +536,18 @@ def run_command(command, workdir=None):
             combined += f"\n[exit code: {result.returncode}]"
         return combined or "(no output)"
     except subprocess.TimeoutExpired:
-        return "❌ Command timed out (120s)"
+        return "❌ Command timed out (300s)"
     except Exception as e:
         return f"❌ Error: {e}"
 
 def list_files(path=".", recursive=False, pattern=None):
     try:
         p = Path(path)
-        glob = f"**/{pattern or '*'}" if recursive else (pattern or "*")
-        files = sorted(str(f.relative_to(p)) for f in p.glob(glob) if f.is_file())
+        if recursive:
+            glob_pat = f"**/{pattern}" if pattern else "**/*"
+        else:
+            glob_pat = pattern or "*"
+        files = sorted(str(f.relative_to(p)) for f in p.glob(glob_pat) if f.is_file())
         return "\n".join(files) if files else "(empty)"
     except Exception as e:
         return f"❌ Error: {e}"
@@ -558,14 +561,15 @@ def _resolve_host(host):
     """Resolve host alias to user@host string"""
     return SSH_HOSTS.get(host.lower(), host)
 
-def _ssh_opts():
-    return "-o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes"
+def _ssh_opts() -> list:
+    return ["-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes"]
 
 def ssh_run(host, command):
     target = _resolve_host(host)
-    cmd = f"ssh {_ssh_opts()} {target} {json.dumps(command)}"
+    # Use list form to avoid double shell-escaping issues with pipes/redirects
+    ssh_parts = ["ssh"] + _ssh_opts().split() + [target, command]
     try:
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=60)
+        result = subprocess.run(ssh_parts, capture_output=True, text=True, timeout=60)
         out = result.stdout.strip()
         err = result.stderr.strip()
         combined = out
@@ -581,9 +585,9 @@ def ssh_run(host, command):
 
 def ssh_upload(host, local_path, remote_path):
     target = _resolve_host(host)
-    cmd = f"scp {_ssh_opts()} {local_path} {target}:{remote_path}"
+    scp_parts = ["scp"] + _ssh_opts() + [local_path, f"{target}:{remote_path}"]
     try:
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120)
+        result = subprocess.run(scp_parts, capture_output=True, text=True, timeout=120)
         if result.returncode == 0:
             return f"✅ Uploaded {local_path} → {target}:{remote_path}"
         return f"❌ SCP failed: {result.stderr.strip()}"
@@ -593,9 +597,9 @@ def ssh_upload(host, local_path, remote_path):
 def ssh_download(host, remote_path, local_path):
     target = _resolve_host(host)
     Path(local_path).parent.mkdir(parents=True, exist_ok=True)
-    cmd = f"scp {_ssh_opts()} {target}:{remote_path} {local_path}"
+    scp_parts = ["scp"] + _ssh_opts() + [f"{target}:{remote_path}", local_path]
     try:
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120)
+        result = subprocess.run(scp_parts, capture_output=True, text=True, timeout=120)
         if result.returncode == 0:
             return f"✅ Downloaded {target}:{remote_path} → {local_path}"
         return f"❌ SCP failed: {result.stderr.strip()}"
@@ -687,24 +691,25 @@ def db_query(connection, sql, params=None):
         # Treat as SQLite file path
         try:
             conn = sqlite3.connect(connection)
-            cur = conn.cursor()
-            cur.execute(sql, params)
-            if cur.description:
-                cols = [d[0] for d in cur.description]
-                rows = cur.fetchall()
+            try:
+                cur = conn.cursor()
+                cur.execute(sql, params)
+                if cur.description:
+                    cols = [d[0] for d in cur.description]
+                    rows = cur.fetchall()
+                    lines = [" | ".join(cols)]
+                    lines.append("-" * len(lines[0]))
+                    for row in rows[:100]:
+                        lines.append(" | ".join(str(v) for v in row))
+                    if len(rows) > 100:
+                        lines.append(f"... ({len(rows)} rows total, showing 100)")
+                    return "\n".join(lines)
+                else:
+                    conn.commit()
+                    affected = cur.rowcount
+                    return f"✅ Query OK, {affected} rows affected"
+            finally:
                 conn.close()
-                lines = [" | ".join(cols)]
-                lines.append("-" * len(lines[0]))
-                for row in rows[:100]:
-                    lines.append(" | ".join(str(v) for v in row))
-                if len(rows) > 100:
-                    lines.append(f"... ({len(rows)} rows total, showing 100)")
-                return "\n".join(lines)
-            else:
-                conn.commit()
-                affected = cur.rowcount
-                conn.close()
-                return f"✅ Query OK, {affected} rows affected"
         except Exception as e:
             return f"❌ SQLite error: {e}"
     elif connection.startswith("postgresql://") or connection.startswith("postgres://"):
@@ -900,9 +905,30 @@ def load_history(session_name=None):
 def save_history(messages, session_name=None):
     f = get_session_file(session_name)
     try:
-        f.write_bytes(pickle.dumps(messages[-50:]))  # keep last 50
+        f.write_bytes(pickle.dumps(messages[-30:]))  # keep last 30
     except:
         pass
+
+
+# ── Context window trimmer ────────────────────────────────────────────────────
+MAX_CONTEXT_MESSAGES = 20  # max non-system messages to send to API
+
+def trim_messages_for_api(messages: list) -> list:
+    '''Keep system prompt + last MAX_CONTEXT_MESSAGES, never split tool call pairs.'''
+    if not messages:
+        return messages
+    system_msgs = [m for m in messages if m.get('role') == 'system']
+    non_system = [m for m in messages if m.get('role') != 'system']
+    if len(non_system) <= MAX_CONTEXT_MESSAGES:
+        return messages
+    trimmed = non_system[-MAX_CONTEXT_MESSAGES:]
+    # Never start with a tool message (orphaned tool result)
+    while trimmed and trimmed[0].get('role') == 'tool':
+        trimmed = trimmed[1:]
+    # Never start with an assistant message that has no user before it
+    while trimmed and trimmed[0].get('role') == 'assistant':
+        trimmed = trimmed[1:]
+    return system_msgs + trimmed
 
 def list_sessions():
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
@@ -1054,11 +1080,12 @@ def run_agent(messages, model, max_iterations=20, extra_tools=None, extra_dispat
             ]
             label = spinner_labels[i % len(spinner_labels)]
 
+            api_messages = trim_messages_for_api(messages)
             if not quiet:
                 with console.status(f"[cyan]{label}...[/cyan]", spinner="dots"):
                     response = client.chat.completions.create(
                         model=model,
-                        messages=messages,
+                        messages=api_messages,
                         tools=tools_to_use,
                         tool_choice="auto",
                         max_tokens=8192,
@@ -1067,7 +1094,7 @@ def run_agent(messages, model, max_iterations=20, extra_tools=None, extra_dispat
             else:
                 response = client.chat.completions.create(
                     model=model,
-                    messages=messages,
+                    messages=api_messages,
                     tools=tools_to_use,
                     tool_choice="auto",
                     max_tokens=8192,
@@ -1148,10 +1175,14 @@ def run_agent(messages, model, max_iterations=20, extra_tools=None, extra_dispat
             if not quiet:
                 console.print(f"[dim]   → {short}[/dim]")
 
+            # Cap tool results to avoid bloating context
+            tool_content = str(result)
+            if len(tool_content) > 8000:
+                tool_content = tool_content[:8000] + "\n...[truncated]"
             messages.append({
                 "role": "tool",
                 "tool_call_id": tc["id"],
-                "content": str(result)
+                "content": tool_content
             })
 
     return "⚠️ Max iterations reached."
