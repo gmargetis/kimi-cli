@@ -47,22 +47,20 @@ from urllib import request as urllib_request
 from urllib.error import URLError
 # Enable arrow keys, history, line editing in interactive mode
 try:
-    import readline
-    readline.parse_and_bind('tab: complete')
-    # Set history file
-    _rl_hist = __import__('pathlib').Path.home() / '.kimi_readline_history'
+    import readline as _readline
+    import atexit as _atexit
+    _readline.parse_and_bind('tab: complete')
+    _rl_hist_path = str(__import__('pathlib').Path.home() / '.kimi_readline_history')
     try:
-        readline.read_history_file(str(_rl_hist))
+        _readline.read_history_file(_rl_hist_path)
     except (FileNotFoundError, PermissionError, OSError):
         pass
-    import atexit
-    def _rl_save():
+    def _rl_save(_path=_rl_hist_path):
         try:
-            readline.write_history_file(str(_rl_hist))
+            _readline.write_history_file(_path)
         except (PermissionError, OSError):
             pass
-    atexit.register(_rl_save)
-    del _rl_hist
+    _atexit.register(_rl_save)
 except ImportError:
     pass  # readline not available (Windows)
 
