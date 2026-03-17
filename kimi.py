@@ -45,6 +45,22 @@ from pathlib import Path
 from datetime import datetime
 from urllib import request as urllib_request
 from urllib.error import URLError
+# Enable arrow keys, history, line editing in interactive mode
+try:
+    import readline
+    readline.parse_and_bind('tab: complete')
+    # Set history file
+    _rl_hist = __import__('pathlib').Path.home() / '.kimi_readline_history'
+    try:
+        readline.read_history_file(str(_rl_hist))
+    except FileNotFoundError:
+        pass
+    import atexit
+    atexit.register(readline.write_history_file, str(_rl_hist))
+    del _rl_hist
+except ImportError:
+    pass  # readline not available (Windows)
+
 from openai import OpenAI
 from rich.console import Console
 from rich.markdown import Markdown
