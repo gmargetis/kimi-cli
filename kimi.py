@@ -2044,12 +2044,15 @@ def main():
     if args.update:
         repo_dir = Path(__file__).parent
         console.print("[cyan]🔄 Updating Kimi CLI...[/cyan]")
-        result = subprocess.run(["git", "-C", str(repo_dir), "pull"], capture_output=True, text=True)
+        # Fetch latest, then reset hard to avoid divergent branch issues
+        fetch = subprocess.run(["git", "-C", str(repo_dir), "fetch", "origin"], capture_output=True, text=True)
+        if fetch.returncode != 0:
+            console.print(f"[red]❌ Fetch failed: {fetch.stderr.strip()}[/red]")
+            return
+        result = subprocess.run(["git", "-C", str(repo_dir), "reset", "--hard", "origin/main"], capture_output=True, text=True)
         if result.returncode == 0:
-            out = result.stdout.strip()
-            console.print(f"[green]✅ {out}[/green]")
-            if out != "Already up to date.":
-                console.print("[dim]Restart kimi to use the new version.[/dim]")
+            console.print(f"[green]✅ Updated to latest version![/green]")
+            console.print("[dim]Restart kimi to use the new version.[/dim]")
         else:
             console.print(f"[red]❌ Update failed: {result.stderr.strip()}[/red]")
         return
@@ -2228,14 +2231,16 @@ def main():
             if user_input.lower() == "update":
                 repo_dir = Path(__file__).parent
                 console.print("[cyan]🔄 Updating Kimi CLI...[/cyan]")
-                r = subprocess.run(["git", "-C", str(repo_dir), "pull"], capture_output=True, text=True)
-                out = r.stdout.strip()
-                if r.returncode == 0:
-                    console.print(f"[green]✅ {out}[/green]")
-                    if out != "Already up to date.":
-                        console.print("[dim]Restart kimi to use the new version.[/dim]")
+                fetch = subprocess.run(["git", "-C", str(repo_dir), "fetch", "origin"], capture_output=True, text=True)
+                if fetch.returncode != 0:
+                    console.print(f"[red]❌ Fetch failed: {fetch.stderr.strip()}[/red]")
                 else:
-                    console.print(f"[red]❌ {r.stderr.strip()}[/red]")
+                    r = subprocess.run(["git", "-C", str(repo_dir), "reset", "--hard", "origin/main"], capture_output=True, text=True)
+                    if r.returncode == 0:
+                        console.print(f"[green]✅ Updated to latest version![/green]")
+                        console.print("[dim]Restart kimi to use the new version.[/dim]")
+                    else:
+                        console.print(f"[red]❌ {r.stderr.strip()}[/red]")
                 continue
             if not user_input.strip():
                 continue
